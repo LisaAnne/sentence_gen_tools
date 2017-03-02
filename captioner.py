@@ -11,15 +11,15 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from skimage.transform import resize
 import copy
+sys.path.append('utils/')
+from python_utils import *
+import itertools
 
-def max_choice_from_probs(softmax_inputs, no_EOS=False, prev_word = None):
-  # if no_EOS True, then the next word will not be the end of the sentence
-  if prev_word:
-    softmax_inputs[prev_word] = 0
-  if no_EOS:
-      return np.argmax(softmax_inputs[1:]) + 1
-  else:
-    return np.argmax(softmax_inputs)
+def max_choice_from_probs(softmax_inputs, **kwargs):
+  return np.argmax(softmax_inputs)
+
+def topK_choice_from_probs(softmax_inputs, k=1):
+  return np.argsort(softmax_inputs)[::-1][:k]
 
 def random_choice_from_probs(softmax_inputs, temp=1, already_softmaxed=False, no_EOS=False, prev_word = None):
   #TODO: max_choice and random_choice need same inputs...
@@ -52,11 +52,11 @@ class Captioner(object):
                sentence_generation_cont_in = 'cont_sentence', sentence_generation_sent_in = 'input_sentence',
                sentence_generation_feature_in = 'image_features', feature_extractor_in = 'data',
                sentence_generation_out='probs',
-               max_length = 50, vocab_file='vocab.txt', device_id = 0,
+               max_length = 50, vocab_file='data/vocab.txt', device_id = 0,
                hidden_inputs=None, hidden_outputs=None, init='zero_init'):
 
     caffe.set_device(device_id)
-    generation_methods = {'max': max_choice_from_probs, 'sample': random_choice_from_probs, 'beam': random_choice_from_probs}
+    generation_methods = {'max': max_choice_from_probs, 'sample': random_choice_from_probs, 'beam': topK_choice_from_probs}
     assert generation_method in generation_methods.keys()
     self.generation_method = generation_method
     self.beam_size = beam_size
@@ -92,18 +92,29 @@ class Captioner(object):
 
     vocab = open(vocab_file).readlines()
     vocab = [v.strip() for v in vocab]
-    self.vocab = ['<unk>', '<EOS>'] + vocab
+    #this needs to be changed -- commenting out in between rounds for now
+    #self.vocab = ['<unk>', '<EOS>'] + vocab
+    self.vocab = ['<EOS>'] + vocab
+    self.vocab_dict = {}
+    for i, w in enumerate(self.vocab):
+      self.vocab_dict[w] = i
+
     self.hidden_inputs = hidden_inputs
     self.hidden_outputs = hidden_outputs
-    if self.hidden_inputs:
-      self.init = init
+    self.init = init
+    if init_net:
       self.init_net = caffe.Net(init_net, init_weights, caffe.TEST)
-     
+    else:
+      self.init_net = None 
+      
   def num_to_words(self, cap):
     if cap[-1] == self.vocab.index('<EOS>'):
       cap = cap[:-1]
     words = [self.vocab[i] for i in cap]
     return ' '.join(words) + '.'
+
+  def words_to_num(self, cap):
+    return tokenize_text(cap, self.vocab_dict) 
 
   def preprocess_image(self, image, oversample=False, 
                        fully_convolutional=False): #TODO: currently designed for CUB dataset; need to make more general
@@ -200,12 +211,11 @@ class Captioner(object):
           net.blobs[self.fe_out].data[:current_batch_size]
     return descriptors
 
-  def init_zeros(self, descriptor):
-    hidden_unit_in = np.zeros_like(self.sentence_generation_net.blobs['lstm1_h0'].data)
-    cell_unit_in = np.zeros_like(self.sentence_generation_net.blobs['lstm1_c0'].data)
-    return hidden_unit_in, cell_unit_in
+  def init_zeros(self, init_in):
+    hidden_init = np.zeros_like(self.sentence_generation_net.blobs[init_in].data)
+    return hidden_init
 
-  def sample_captions(self, features):
+  def sample_captions(self, features, batch_size=None):
  
     '''
       features: list of features or ndarray of features with dimentions num_samples X feature_dim
@@ -227,10 +237,11 @@ class Captioner(object):
     features_in = self.sg_feature_in
     sg_out = self.sg_out
 
-    batch_size = features[0].shape[0]
-    self.set_caption_batch_size(batch_size)
-    if self.hidden_inputs:
-      self.set_init_batch_size(batch_size)
+    if not batch_size:
+      batch_size = features[0].shape[0]
+      self.set_caption_batch_size(batch_size)
+      if self.init_net:
+        self.set_init_batch_size(batch_size)
 
     cont_input = np.zeros_like(net.blobs[cont_in].data)
     word_input = np.zeros_like(net.blobs[sent_in].data)
@@ -308,7 +319,7 @@ class Captioner(object):
 
     return output_captions, output_probs
 
-  def es_sample_captions(self, features_n, feature_p):
+  def es_sample_captions(self, features_p, features_n):
  
     '''
       features: list of features or ndarray of features with dimentions num_samples X feature_dim
@@ -329,25 +340,24 @@ class Captioner(object):
     features_n = update_features(features_n)
 
     eos_idx = self.vocab.index('<EOS>')
+    net = self.sentence_generation_net
     cont_in = self.sg_cont_in
     sent_in = self.sg_sent_in
     features_in = self.sg_feature_in
     sg_out = self.sg_out
 
-    batch_size = features[0].shape[0]*2
-    slice_point = features[0].shape[0]
+    batch_size = features_p[0].shape[0]*2
+    slice_point = features_p[0].shape[0]
     self.set_caption_batch_size(batch_size)
-    if self.hidden_inputs:
+    if self.init_net:
       self.set_init_batch_size(batch_size)
 
     cont_input = np.zeros_like(net.blobs[cont_in].data)
     word_input = np.zeros_like(net.blobs[sent_in].data)
-    for feature_in, feature in zip(features_in, features):
-      assert feature.shape == net.blobs[feature_in].data.shape
 
     outputs = []
-    output_captions = [[] for b in range(batch_size)]
-    output_probs = [[] for b in range(batch_size)]
+    output_captions = [[] for b in range(slice_point)]
+    output_probs = [[] for b in range(slice_point)]
     caption_index = 0
     num_done = 0
 
@@ -372,8 +382,11 @@ class Captioner(object):
       if caption_index == 0:
         word_input[:] = 0
       else:
-        for index in range(batch_size):
+        for index in range(slice_point):
           word_input[0, index] = \
+              output_captions[index][caption_index - 1] if \
+              caption_index <= len(output_captions[index]) else 0
+          word_input[0, slice_point+index] = \
               output_captions[index][caption_index - 1] if \
               caption_index <= len(output_captions[index]) else 0
 
@@ -390,7 +403,12 @@ class Captioner(object):
       
       net.forward()
       net_output_probs = copy.deepcopy(net.blobs[sg_out].data[0])
-      #pdb.set_trace()
+      output_probs_p = net_output_probs[:slice_point]
+      output_probs_n = net_output_probs[slice_point:]
+      l = 0.5 
+      #output_probs_div = l*output_probs_p+((1-l)*(output_probs_p/output_probs_n))
+      #output_probs_div = l*np.log(output_probs_p) - (1-l)*np.log(output_probs_n)
+      output_probs_div = np.log(output_probs_p) - (1-l)*np.log(output_probs_n)
 
       if self.hidden_inputs: #TODO: Cleaner way to access these blobs
         hidden_inputs = []
@@ -399,7 +417,7 @@ class Captioner(object):
 
       samples = [
           self.word_sample_method(dist)
-          for dist in net_output_probs
+          for dist in output_probs_div 
       ]
        
       for index, next_word_sample in enumerate(samples):
@@ -417,4 +435,378 @@ class Captioner(object):
     sys.stdout.write('\n')
 
     return output_captions, output_probs
+
+  def get_word_gen_prob(self, input_values, input_names, output='probs', batch_size=1):
+    net = self.sentence_generation_net
+    self.set_caption_batch_size(batch_size)
+    for input_value, input_name in zip(input_values, input_names):
+      self.sentence_generation_net.blobs[input_name].data[...] = input_value
+    net.forward()
+    return net.blobs[output].data.copy()
+
+  def beam_search(self, features, beam_size=5):
+    '''
+      features: list of features or ndarray of features with dimentions num_samples X feature_dim
+    '''
+
+    feature_array = [] 
+    for feature in features: 
+      if isinstance(feature, list):
+        feature = np.array(feature)
+      feature_array.append(feature)
+    features = feature_array
+    if not isinstance(features[0], np.ndarray):
+      raise Exception("Descriptors must be either a list of numpy arrays, or a numpy array of dimensions samples X feature dim")
+
+    eos_idx = self.vocab.index('<EOS>')
+    net = self.sentence_generation_net
+    cont_in = self.sg_cont_in
+    sent_in = self.sg_sent_in
+    features_in = self.sg_feature_in
+    sg_out = self.sg_out
+
+    batch_size = features[0].shape[0]
+    all_features_rep = []
+    for feature in features:
+      features_rep = np.zeros(((batch_size*beam_size,) + feature.shape[1:]))
+      for i in range(batch_size):
+        for j in range(beam_size):
+          features_rep[i*beam_size:i*beam_size+j,...] = feature[i,:]
+      all_features_rep.append(features_rep)
+    features = all_features_rep
+    self.set_caption_batch_size(batch_size*beam_size)
+    if self.init_net:
+      self.set_init_batch_size(batch_size*beam_size)
+
+    cont_input = np.zeros_like(net.blobs[cont_in].data)
+    word_input = np.zeros_like(net.blobs[sent_in].data)
+    for feature_in, feature in zip(features_in, features):
+      assert feature.shape == net.blobs[feature_in].data.shape
+
+    output_captions = [[[] for bs in range(beam_size)] for b in range(batch_size)]
+    output_probs = [[[] for bs in range(beam_size)] for b in range(batch_size)]
+    caption_index = 0
+    num_done = 0
+
+    assert self.hidden_inputs
+    assert self.hidden_inputs
+
+    #init
+    hidden_inputs = []
+    if self.init == 'zero_init':
+      for hidden_input in self.hidden_inputs:
+        hidden_inputs.append(self.init_zeros(hidden_input))
+    elif self.init == 'init_net':
+      self.init_net.blobs['image_data'].data[...] = features[0]
+      self.init_net.forward()
+      for hidden_input in self.hidden_inputs:
+        hidden_inputs.append(copy.deepcopy(self.init_net.blobs[hidden_input].data))
+      
+    while num_done < batch_size*beam_size and caption_index < self.max_length:
+      if caption_index == 0:
+        cont_input[:] = 0
+      elif caption_index == 1:
+        cont_input[:] = 1
+
+      if caption_index == 0:
+        word_input[:] = 0
+      else:
+        for index_cap in range(batch_size):
+          for index_beam in range(beam_size):
+            word_input[0, index_cap*beam_size+index_beam] = \
+                output_captions[index_cap][index_beam][caption_index - 1] if \
+                caption_index <= len(output_captions[index_cap][index_beam]) else 0
+
+      for feature_in, feature in zip(features_in, features):
+        net.blobs[feature_in].data[...] = feature
+      net.blobs[cont_in].data[...] = cont_input
+      net.blobs[sent_in].data[...] = word_input
+
+      for hidden_input_name, hidden_input in zip(self.hidden_inputs, hidden_inputs):
+        net.blobs[hidden_input_name].data[...] = hidden_input 
+
+      net.forward()
+      net_output_probs = copy.deepcopy(net.blobs[sg_out].data[0])
+      #pdb.set_trace()
+
+
+      samples = [
+          self.word_sample_method(dist, k=beam_size)
+          for dist in net_output_probs
+      ]
+
+      probs = [
+          [net_output_probs[idx, w] 
+          for w in sample] for
+          idx, sample in zip(range(beam_size), samples)
+      ]
+
+     
+      #set when we decide which beams to take...
+      for hidden_i, hidden_output_name in enumerate(self.hidden_outputs):
+        hidden_inputs[hidden_i][...] = 0
+      for index_cap, beam_captions in enumerate(output_captions):
+        caption_samples = samples[index_cap*beam_size:index_cap*beam_size+beam_size]
+        caption_probs = probs[index_cap*beam_size:index_cap*beam_size+beam_size]
+        beam_expansions = []
+        beam_expansions_probs = []
+        for index_beam, caption in enumerate(beam_captions):
+          # If the caption is empty, or non-empty but the last word isn't EOS,
+          # predict another word.
+          beam_samples = caption_samples[index_beam]
+          beam_probs = caption_probs[index_beam]
+          if not caption or caption[-1] != eos_idx:
+            prob = output_probs[index_cap][index_beam]
+            for beam_prob, beam_sample in zip(beam_probs, beam_samples):
+              beam_expansions.append(caption + [beam_sample])
+              beam_expansions_probs.append(prob + [beam_prob])
+          else:
+            prob = output_probs[index_cap][index_beam]
+            beam_expansions.append(caption)
+            beam_expansions_probs.append(prob)
+
+        #choose the best expansions based off sum of log probs
+        #if caption index == 0, thinks are different because will have five of the same beam...
+        if caption_index == 0:
+          beam_expansions_probs[beam_size:] = [[0.001] for b in \
+                            beam_expansions_probs[beam_size:]]
+
+        log_probs = [np.sum(np.log(beam_prob)) for beam_prob in beam_expansions_probs]
+        best_idxs = np.argsort(log_probs)[::-1][:beam_size]
+
+        for idx, best_idx in enumerate(best_idxs):
+          output_captions[index_cap][idx] = beam_expansions[best_idx]
+          output_probs[index_cap][idx] = beam_expansions_probs[best_idx]
+          orig_beam = best_idx % beam_size
+          hidden_index = index_cap*beam_size + orig_beam
+          for hidden_i, hidden_output_name in enumerate(self.hidden_outputs):
+            tmp = net.blobs[hidden_output_name].data[0,hidden_index,:].copy() 
+            hidden_inputs[hidden_i][0,index_cap*beam_size+idx,:] = tmp 
+      num_done = 0
+      for beam_captions in output_captions:
+        for caption in beam_captions:
+          if caption[-1] == 0:
+            num_done += 1
+      sys.stdout.write('\r%d/%d done after word %d' %
+          (num_done, batch_size, caption_index))
+      sys.stdout.flush()
+      caption_index += 1
+    sys.stdout.write('\n')
+
+    return output_captions, output_probs
+  
+  def beam_search_constrained(self, features, beam_size=5, negative_phrases=None, positive_phrases=None):
+    '''
+      features: list of features or ndarray of features with dimentions num_samples X feature_dim
+    '''
+
+    feature_array = [] 
+    for feature in features: 
+      if isinstance(feature, list):
+        feature = np.array(feature)
+      feature_array.append(feature)
+    features = feature_array
+    if not isinstance(features[0], np.ndarray):
+      raise Exception("Descriptors must be either a list of numpy arrays, or a numpy array of dimensions samples X feature dim")
+
+    positive_phrases_tokenize = [self.words_to_num(positive_phrase) for positive_phrase in positive_phrases] 
+    negative_phrases_tokenize = [self.words_to_num(negative_phrase) for negative_phrase in negative_phrases] 
+
+    eos_idx = self.vocab.index('<EOS>')
+    net = self.sentence_generation_net
+    cont_in = self.sg_cont_in
+    sent_in = self.sg_sent_in
+    features_in = self.sg_feature_in
+    sg_out = self.sg_out
+
+    num_beams = 2 
+    positive_permutations = []
+    for item in itertools.permutations(positive_phrases):
+      positive_permutations.append(item)
+
+    batch_size = features[0].shape[0]
+    all_features_rep = []
+    for feature in features:
+      features_rep = np.zeros(((batch_size*beam_size*num_beams,) + feature.shape[1:]))
+      for i in range(batch_size):
+        for j in range(beam_size*num_beams):
+          features_rep[i*beam_size*num_beams:i*beam_size*num_beams+j,...] = feature[i,:]
+      all_features_rep.append(features_rep)
+    features = all_features_rep
+    self.set_caption_batch_size(batch_size*beam_size*num_beams)
+    if self.init_net:
+      self.set_init_batch_size(batch_size*beam_size*num_beams)
+
+    cont_input = np.zeros_like(net.blobs[cont_in].data)
+    word_input = np.zeros_like(net.blobs[sent_in].data)
+    for feature_in, feature in zip(features_in, features):
+      assert feature.shape == net.blobs[feature_in].data.shape
+
+    output_captions = [[[] for bs in range(beam_size*num_beams)] for b in range(batch_size)]
+    output_probs = [[[] for bs in range(beam_size*num_beams)] for b in range(batch_size)]
+    caption_index = 0
+    num_done = 0
+
+    assert self.hidden_inputs
+    assert self.hidden_inputs
+
+    #init
+    hidden_inputs = []
+    if self.init == 'zero_init':
+      for hidden_input in self.hidden_inputs:
+        hidden_inputs.append(self.init_zeros(hidden_input))
+    elif self.init == 'init_net':
+      self.init_net.blobs['image_data'].data[...] = features[0]
+      self.init_net.forward()
+      for hidden_input in self.hidden_inputs:
+        hidden_inputs.append(copy.deepcopy(self.init_net.blobs[hidden_input].data))
+      
+    while num_done < batch_size*beam_size*num_beams and caption_index < self.max_length:
+      if caption_index == 0:
+        cont_input[:] = 0
+      elif caption_index == 1:
+        cont_input[:] = 1
+
+      if caption_index == 0:
+        word_input[:] = 0
+      else:
+        for index_cap in range(batch_size):
+          for index_beam in range(beam_size*num_beams):
+            word_input[0, index_cap*beam_size*num_beams+index_beam] = \
+                output_captions[index_cap][index_beam][caption_index - 1] if \
+                caption_index <= len(output_captions[index_cap][index_beam]) else 0
+
+      for feature_in, feature in zip(features_in, features):
+        net.blobs[feature_in].data[...] = feature
+      net.blobs[cont_in].data[...] = cont_input
+      net.blobs[sent_in].data[...] = word_input
+
+      for hidden_input_name, hidden_input in zip(self.hidden_inputs, hidden_inputs):
+        net.blobs[hidden_input_name].data[...] = hidden_input 
+
+      net.forward()
+      net_output_probs = copy.deepcopy(net.blobs[sg_out].data[0])
+      #pdb.set_trace()
+
+
+      def get_phrase_leading_expansion(expansion, phrases, leading=True, contains=True):
+        #given an expansion and phrases, mark all expansion which include a phrase in its entirety or could lead to the production of that phrase 
+        for phrase in phrases:
+          len_phrase = len(phrase)
+          if contains:
+            if any((phrase == expansion[i:i+len_phrase]) for i in xrange(len(expansion)-len_phrase+1)):
+              return True
+          if leading:
+            for i in range(1,len_phrase):
+              if expansion[-i:] == phrase[:i]:
+                return True                  
+        return False
+
+      def get_leading_index(expansion, phrase):
+        len_phrase = len(phrase)
+        if expansion:
+          for i in range(1,len_phrase):
+            if expansion[-i:] == phrase[:i]:
+              return i
+        return 0                  
+
+      samples = [
+          self.word_sample_method(dist, k=beam_size)
+          for dist in net_output_probs
+      ]
+
+      #add beginning of positive phrase to each expansion
+      for i, sample in enumerate(samples):
+        i1 = i/(beam_size*2)
+        i2 = i % (beam_size*2)
+        for positive_phrase in positive_phrases_tokenize:
+          positive_phrase_idx = get_leading_index(output_captions[i1][i2], positive_phrase)
+          sample = np.concatenate((sample, np.array([positive_phrase[positive_phrase_idx]])), axis=0)
+          samples[i] = sample
+
+      probs = [
+          [net_output_probs[idx, w] 
+          for w in sample] for
+          idx, sample in zip(range(beam_size*num_beams), samples)
+      ]
+
+     
+      #set when we decide which beams to take...
+      for hidden_i, hidden_output_name in enumerate(self.hidden_outputs):
+        hidden_inputs[hidden_i][...] = 0
+      for index_cap, beam_captions in enumerate(output_captions):
+        caption_samples = samples[index_cap*beam_size*num_beams:index_cap*beam_size*num_beams+beam_size*num_beams]
+        caption_probs = probs[index_cap*beam_size*num_beams:index_cap*beam_size*num_beams+beam_size*num_beams]
+        beam_expansions = []
+        beam_expansions_probs = []
+        for index_beam, caption in enumerate(beam_captions):
+          # If the caption is empty, or non-empty but the last word isn't EOS,
+          # predict another word.
+          beam_samples = caption_samples[index_beam]
+          beam_probs = caption_probs[index_beam]
+          if not caption or caption[-1] != eos_idx:
+            prob = output_probs[index_cap][index_beam]
+            for beam_prob, beam_sample in zip(beam_probs, beam_samples):
+              beam_expansions.append(caption + [beam_sample])
+              beam_expansions_probs.append(prob + [beam_prob])
+          else:
+            prob = output_probs[index_cap][index_beam]
+            beam_expansions.append(caption)
+            beam_expansions_probs.append(prob)
+
+        #choose the best expansions based off sum of log probs
+        #if caption index == 0, thinks are different because will have five of the same beam...
+        if caption_index == 0:
+          beam_expansions_probs[beam_size+len(positive_phrases):] = [[0.00001] for b in \
+                            beam_expansions_probs[beam_size+len(positive_phrases):]]
+
+        #sort into groups: 
+        #  (1) contain positive phrase or positive leading phrase
+        #  (2) contain negative leading phrase
+
+        positive_expansions = []
+        negative_leading_expansions = []
+        for idx_expansion, beam_expansion in enumerate(beam_expansions):
+          positive_expansions.append(get_phrase_leading_expansion(beam_expansion, positive_phrases_tokenize))
+          negative_leading_expansions.append(get_phrase_leading_expansion(beam_expansion, negative_phrases_tokenize, contains=False))
+          if get_phrase_leading_expansion(beam_expansion, negative_phrases_tokenize, leading=False):
+            beam_expansions_probs[idx_expansion] = [0.000001]
+
+        neutral_expansions = [(not p) & (not n) for p, n in zip(positive_expansions, negative_leading_expansions)]
+
+        log_probs = [np.exp(np.sum(np.log(beam_prob))) for beam_prob in beam_expansions_probs]
+        best_idxs_general = np.argsort(log_probs*np.array(neutral_expansions))[::-1][:beam_size]
+        best_idxs_positive = np.argsort(log_probs*np.array(positive_expansions))[::-1][:beam_size]
+        best_idxs_negative = np.argsort(log_probs*np.array(negative_leading_expansions))[::-1][:beam_size]
+
+
+        #make best idxs for general beam; must have at least one option which is not negative leading
+        if log_probs[best_idxs_general[0]] < log_probs[best_idxs_negative[-1]]:
+          gen_idxs = best_idxs_negative[:4] + [best_idxs_general[0]]
+        else:
+          gen_idxs = np.argsort(log_probs*(1-np.array(positive_expansions)))[::-1][:beam_size] 
+
+        best_idxs = np.ndarray.tolist(gen_idxs) + np.ndarray.tolist(best_idxs_positive)
+        pdb.set_trace()
+        for idx, best_idx in enumerate(best_idxs):
+          output_captions[index_cap][idx] = beam_expansions[best_idx]
+          output_probs[index_cap][idx] = beam_expansions_probs[best_idx]
+          orig_beam = best_idx % (beam_size + len(positive_phrases))
+          hidden_index = index_cap*(beam_size + len(positive_phrases)) + orig_beam
+          for hidden_i, hidden_output_name in enumerate(self.hidden_outputs):
+            tmp = net.blobs[hidden_output_name].data[0,hidden_index,:].copy() 
+            hidden_inputs[hidden_i][0,index_cap*beam_size+idx,:] = tmp 
+      num_done = 0
+      for beam_captions in output_captions:
+        for caption in beam_captions:
+          if caption[-1] == 0:
+            num_done += 1
+      sys.stdout.write('\r%d/%d done after word %d' %
+          (num_done, batch_size, caption_index))
+      sys.stdout.flush()
+      caption_index += 1
+    sys.stdout.write('\n')
+
+    return output_captions, output_probs
+
 
