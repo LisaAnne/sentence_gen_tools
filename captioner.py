@@ -15,14 +15,18 @@ sys.path.append('utils/')
 from python_utils import *
 import itertools
 
-def max_choice_from_probs(softmax_inputs, **kwargs):
+def max_choice_from_probs(softmax_inputs, no_EOS=False, prev_word=None):
+  #TODO: need to fix argument in max choice from probs, random choice from probs, and topK choice from probs
+  if prev_word:
+    softmax_inputs[prev_word] = 0
+  if no_EOS:
+    softmax_inputs[0] = 0 #EOS token
   return np.argmax(softmax_inputs)
 
 def topK_choice_from_probs(softmax_inputs, k=1):
   return np.argsort(softmax_inputs)[::-1][:k]
 
 def random_choice_from_probs(softmax_inputs, temp=1, already_softmaxed=False, no_EOS=False, prev_word = None):
-  #TODO: max_choice and random_choice need same inputs...
   if already_softmaxed:
     probs = softmax_inputs
     assert temp == 1
@@ -53,7 +57,8 @@ class Captioner(object):
                sentence_generation_feature_in = 'image_features', feature_extractor_in = 'data',
                sentence_generation_out='probs',
                max_length = 50, vocab_file='data/vocab.txt', device_id = 0,
-               hidden_inputs=None, hidden_outputs=None, init='zero_init'):
+               hidden_inputs=None, hidden_outputs=None, init='zero_init',
+               prev_word_restriction=False):
 
     caffe.set_device(device_id)
     generation_methods = {'max': max_choice_from_probs, 'sample': random_choice_from_probs, 'beam': topK_choice_from_probs}
@@ -75,6 +80,8 @@ class Captioner(object):
     self.make_sentence_generation_net(generation_proto, generation_weights)
     self.feature_extractor_net = None
     if feature_proto:
+      if not feature_weights:
+        feature_weights = generation_weights 
       self.make_feature_extractor_net(feature_proto, feature_weights)
       image_data_shape = self.feature_extractor_net.blobs[self.fe_in].data.shape
       self.transformer = caffe.io.Transformer({self.fe_in: image_data_shape})
@@ -106,6 +113,7 @@ class Captioner(object):
       self.init_net = caffe.Net(init_net, init_weights, caffe.TEST)
     else:
       self.init_net = None 
+    self.prev_word_restriction = prev_word_restriction
       
   def num_to_words(self, cap):
     if cap[-1] == self.vocab.index('<EOS>'):
@@ -298,9 +306,13 @@ class Captioner(object):
         for hidden_output_name in self.hidden_outputs:
           hidden_inputs.append(copy.deepcopy(net.blobs[hidden_output_name].data[...])) 
 
+      if (self.prev_word_restriction) & (caption_index > 0):
+        prev_words = [output_caption[-1] for output_caption in output_captions]
+      else: prev_words = [False]*len(output_captions)
+
       samples = [
-          self.word_sample_method(dist)
-          for dist in net_output_probs
+          self.word_sample_method(dist, prev_word=prev_word)
+          for dist, prev_word in zip(net_output_probs, prev_words)
       ]
        
       for index, next_word_sample in enumerate(samples):
@@ -596,4 +608,34 @@ class Captioner(object):
     sys.stdout.write('\n')
 
     return output_captions, output_probs
-  
+ 
+  def caption_images(self, descriptors, im_list, batch_size=100, caption_method='sample_captions'):  
+    final_captions = {}
+    num_images = len(im_list)
+    descriptor_shape = descriptors.values()[0].shape[0]
+    for i in range(0, num_images, batch_size):
+      print 'Captioning image: %d/%d' %(i, num_images)
+      mini_batch_size = min(batch_size, num_images-i)
+      batch_images = im_list[i:i+mini_batch_size]
+      batch_descriptors = np.zeros((mini_batch_size, descriptor_shape))
+      for count_im, im in enumerate(batch_images):
+        batch_descriptors[count_im,:] = descriptors[im]
+      network_inputs = [batch_descriptors]
+      if caption_method == 'sample_captions':
+        output_caps, output_probs = self.sample_captions(network_inputs)
+        for im, cap in zip(batch_images, output_caps):
+          final_captions[im] = self.num_to_words(cap)
+      else:
+        raise Exception("Can only use this function if generating captions via sampling")
+    return final_captions 
+
+
+
+
+
+
+
+
+
+
+ 
